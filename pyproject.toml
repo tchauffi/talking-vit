@@ -22,7 +22,7 @@ requires = ["uv_build>=0.9.5,<0.10.0"]
 build-backend = "uv_build"
 
 [project.optional-dependencies]
-dev = ["ruff"]
+dev = ["ruff", "pre-commit"]
 
 [tool.ruff]
 line-length = 88
@@ -40,5 +40,6 @@ line-ending = "auto"
 
 [dependency-groups]
 dev = [
+    "pre-commit>=4.6.0",
     "ruff>=0.15.13",
 ]
