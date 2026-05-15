@@ -4,6 +4,7 @@ from torch import nn
 
 
 class PatchEmbedder(nn.Module):
+    """Image Embedder used to turn image to tokens"""
     def __init__(
         self,
         image_size: int = 224,
