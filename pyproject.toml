@@ -6,12 +6,13 @@ readme = "README.md"
 authors = [
     { name = "Thibaut CHAUFFIER", email = "tchauffi@gmail.com" }
 ]
-requires-python = ">=3.10"
+requires-python = ">=3.12, <3.14"
 dependencies = [
+    "accelerate>=1.13.0",
     "einops>=0.8.2",
-    "tokenizers>=0.23.1",
     "torch>=2.5.1",
     "torchvision>=0.27.0",
+    "transformers>=4.40.0",
 ]
 
 [project.scripts]
@@ -41,5 +42,6 @@ line-ending = "auto"
 [dependency-groups]
 dev = [
     "pre-commit>=4.6.0",
+    "pytest>=8.0.0",
     "ruff>=0.15.13",
 ]
