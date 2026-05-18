@@ -3,7 +3,6 @@ from dataclasses import dataclass
 import torch
 from einops import rearrange
 from torch import nn
-from torch.nn import functional as F
 
 
 class PatchEmbedder(nn.Module):
@@ -15,7 +14,14 @@ class PatchEmbedder(nn.Module):
         in_dim: Number of input channels.
         embed_dim: Dimension of the output patch embeddings.
         add_cls: If True, prepends a learnable [CLS] token to the sequence.
+        use_clip_weights: If True, initialise ``patch_proj`` from the
+            ``openai/clip-vit-base-patch16`` checkpoint and freeze it.
+            Requires ``patch_size=16`` and ``embed_dim=768``.
     """
+
+    CLIP_MODEL = "openai/clip-vit-base-patch16"
+    CLIP_PATCH_SIZE = 16
+    CLIP_EMBED_DIM = 768
 
     def __init__(
         self,
@@ -24,6 +30,7 @@ class PatchEmbedder(nn.Module):
         in_dim: int = 3,
         embed_dim: int = 768,
         add_cls: bool = False,
+        use_clip_weights: bool = False,
     ):
         super().__init__()
         self.image_size = image_size
@@ -33,26 +40,60 @@ class PatchEmbedder(nn.Module):
 
         self.add_cls = add_cls
 
-        self.n_patches = (image_size // patch_size) ** 2
+        self.n_rows = image_size // patch_size
+        self.n_cols = image_size // patch_size
+        self.n_patches = self.n_rows * self.n_cols
 
         self.patch_proj = nn.Conv2d(
             self.in_dim, self.embeded_dim, self.patch_size, self.patch_size, bias=False
         )
+
+        # Separate row and column embeddings, added together at each patch position.
+        # This encodes 2D spatial structure with only (n_rows + n_cols) * d parameters
+        # instead of n_patches * d for a flat positional embedding.
+        self.row_emb = nn.Embedding(self.n_rows, self.embeded_dim)
+        self.col_emb = nn.Embedding(self.n_cols, self.embeded_dim)
+
+        # Trainable projection that maps patch features into GPT-2's token embedding
+        # space. Critical when patch_proj is frozen (e.g. CLIP weights): without it,
+        # CLIP features land in CLIP's space which GPT-2 cannot interpret.
+        # Initialised as identity so behaviour at step 0 is unchanged.
+        self.img_proj = nn.Linear(self.embeded_dim, self.embeded_dim)
+
         if self.add_cls:
             self.cls_token = nn.Parameter(torch.zeros((1, 1, self.embeded_dim)))
 
         self._init_weights()
 
+        if use_clip_weights:
+            self._load_clip_weights()
+
     def _init_weights(self):
-        """
-        Init module weights
-        """
         nn.init.trunc_normal_(
             self.patch_proj.weight.data.view(self.embeded_dim, -1), std=0.02
         )
+        nn.init.trunc_normal_(self.row_emb.weight, std=0.02)
+        nn.init.trunc_normal_(self.col_emb.weight, std=0.02)
+        nn.init.eye_(self.img_proj.weight)
+        nn.init.zeros_(self.img_proj.bias)
 
         if self.add_cls:
             nn.init.trunc_normal_(self.cls_token, std=0.02)
+
+    def _load_clip_weights(self) -> None:
+        if self.patch_size != self.CLIP_PATCH_SIZE or self.embeded_dim != self.CLIP_EMBED_DIM:
+            raise ValueError(
+                f"CLIP weights require patch_size={self.CLIP_PATCH_SIZE} and "
+                f"embed_dim={self.CLIP_EMBED_DIM}, "
+                f"got patch_size={self.patch_size} and embed_dim={self.embeded_dim}."
+            )
+        from transformers import CLIPVisionModel
+
+        clip = CLIPVisionModel.from_pretrained(self.CLIP_MODEL)
+        clip_weight = clip.embeddings.patch_embedding.weight.data
+        self.patch_proj.weight.data.copy_(clip_weight)
+        self.patch_proj.requires_grad_(False)
+        del clip
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         bz, _, h, w = x.shape
@@ -63,6 +104,13 @@ class PatchEmbedder(nn.Module):
 
         feat = self.patch_proj(x)
         feat = rearrange(feat, "b d h w -> b (h w) d")
+
+        # Build 2D positional embeddings: row_emb[i] + col_emb[j] for each patch (i, j)
+        n_h, n_w = h // self.patch_size, w // self.patch_size
+        rows = torch.arange(n_h, device=x.device).repeat_interleave(n_w)
+        cols = torch.arange(n_w, device=x.device).repeat(n_h)
+        feat = feat + self.row_emb(rows) + self.col_emb(cols)
+        feat = self.img_proj(feat)
 
         if self.add_cls:
             cls = self.cls_token.expand(bz, -1, -1)
@@ -106,6 +154,7 @@ class MultiModEmbedder(nn.Module):
         in_dim: Number of input image channels.
         embed_dim: Dimension of the output embeddings.
         add_cls: If True, prepends a learnable [CLS] token to image embeddings.
+        use_clip_weights: If True, load frozen CLIP patch-projection weights.
     """
     def __init__(
         self,
@@ -114,8 +163,8 @@ class MultiModEmbedder(nn.Module):
         patch_size: int = 16,
         in_dim: int = 3,
         embed_dim: int = 768,
-        add_cls: bool = False
-        ,
+        add_cls: bool = False,
+        use_clip_weights: bool = False,
     ):
         super().__init__()
 
@@ -125,9 +174,11 @@ class MultiModEmbedder(nn.Module):
             in_dim=in_dim,
             embed_dim=embed_dim,
             add_cls=add_cls,
+            use_clip_weights=use_clip_weights,
         )
 
         self.text_embedder = TextEmbedder(vocab_size=vocab_size, embed_dim=embed_dim)
+
 
     def forward(self, images: torch.Tensor, text_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """
@@ -164,10 +215,17 @@ class MultiHeadMixedAttention(nn.Module):
         mask[:full_attention_length, :full_attention_length] = 0.
         self.register_buffer("mask", mask)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        key_padding_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """
         Args:
             x: Input tensor of shape (batch_size, seq_len, d_in)
+            key_padding_mask: Optional (batch_size, seq_len) tensor; 1 marks real
+                tokens and 0 marks padding. Padding keys are excluded from
+                attention.
 
         Returns:
             Output tensor of shape (batch_size, seq_len, d_out)
@@ -186,8 +244,15 @@ class MultiHeadMixedAttention(nn.Module):
         # Compute attention scores
         scores = q @ k.transpose(-2, -1) / (head_dim ** 0.5)
 
-        # Apply mask
+        # Apply causal / mixed mask
         scores = scores.masked_fill(self.mask[:seq_len, :seq_len] == 1, -torch.inf)
+
+        # Exclude padding tokens from the keys every query attends to.
+        # Causal masking guarantees that even pad query positions still see at
+        # least the image tokens (which are never padded), so softmax is safe.
+        if key_padding_mask is not None:
+            pad = (key_padding_mask == 0)[:, None, None, :]
+            scores = scores.masked_fill(pad, -torch.inf)
 
         # Apply softmax
         attn_weights = torch.softmax(scores, dim=-1)
@@ -231,6 +296,9 @@ class GPT2Config:
         image_size: Height/width of the input image.
         patch_size: Height/width of each image patch.
         in_dim: Number of image input channels.
+        add_cls: If True, prepend a learnable [CLS] token to the image sequence
+            (used as the image-side embedding for contrastive alignment).
+        contrastive_dim: Output dimension of the contrastive projection heads.
     """
     vocab_size: int = 50257
     context_length: int = 1024
@@ -241,10 +309,17 @@ class GPT2Config:
     image_size: int = 224
     patch_size: int = 16
     in_dim: int = 3
+    use_clip_weights: bool = False
+    add_cls: bool = False
+
+    @property
+    def num_patch_tokens(self) -> int:
+        return (self.image_size // self.patch_size) ** 2
 
     @property
     def num_img_tokens(self) -> int:
-        return (self.image_size // self.patch_size) ** 2
+        """Length of the image-token prefix in the joint sequence (CLS + patches)."""
+        return self.num_patch_tokens + (1 if self.add_cls else 0)
 
 
 class TransformerBlock(nn.Module):
@@ -268,8 +343,12 @@ class TransformerBlock(nn.Module):
         self.ln_2 = nn.LayerNorm(config.embed_dim)
         self.mlp = FeedForward(config.embed_dim)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x + self.attn(self.ln_1(x))
+    def forward(
+        self,
+        x: torch.Tensor,
+        key_padding_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        x = x + self.attn(self.ln_1(x), key_padding_mask=key_padding_mask)
         x = x + self.mlp(self.ln_2(x))
         return x
 
@@ -294,6 +373,8 @@ class LookingGPT2(nn.Module):
             patch_size=config.patch_size,
             in_dim=config.in_dim,
             embed_dim=config.embed_dim,
+            add_cls=config.add_cls,
+            use_clip_weights=config.use_clip_weights,
         )
         self.pos_emb = nn.Embedding(config.context_length, config.embed_dim)
         self.drop = nn.Dropout(config.dropout)
@@ -304,32 +385,56 @@ class LookingGPT2(nn.Module):
         # Tie lm_head weights to token embeddings (as in GPT-2)
         self.lm_head.weight = self.multimod_embedder.text_embedder.embedder.weight
 
-    def forward(self, images: torch.Tensor, text_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(
+        self,
+        images: torch.Tensor,
+        text_ids: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """
         Args:
             images: Image tensor of shape (batch_size, in_dim, H, W).
             text_ids: Token IDs of shape (batch_size, text_seq_len).
+            attention_mask: Optional (batch_size, text_seq_len) tensor; 1 for real
+                tokens and 0 for padding. Padding keys are excluded from attention.
 
         Returns:
-            Logits of shape (batch_size, text_seq_len, vocab_size).
+            Logits of shape (batch_size, text_seq_len + 1, vocab_size). The k-th
+            logit is the next-token prediction after seeing all image tokens plus
+            text tokens [0..k-1]. Index 0 is image-only context (predicts the
+            first text token); the final index is the prediction for the token
+            that would follow the input sequence (used at generation time).
         """
         img_emb, txt_emb = self.multimod_embedder(images, text_ids)
-        x = torch.cat([img_emb, txt_emb], dim=1)
 
-        seq_len = x.shape[1]
-        positions = torch.arange(seq_len, device=x.device)
-        x = self.drop(x + self.pos_emb(positions))
+        # Position embeddings apply to text only; image already carries 2D
+        # row/col embeddings. With this setup wpe[0] maps to the first text
+        # token, matching the position semantics GPT-2 was pretrained with.
+        text_seq_len = txt_emb.shape[1]
+        text_positions = torch.arange(text_seq_len, device=txt_emb.device)
+        txt_emb = txt_emb + self.pos_emb(text_positions)
+
+        x = self.drop(torch.cat([img_emb, txt_emb], dim=1))
+
+        # Full key-padding mask: image tokens are never padded.
+        key_padding_mask: torch.Tensor | None = None
+        if attention_mask is not None:
+            img_ones = torch.ones(
+                img_emb.shape[:2], device=x.device, dtype=attention_mask.dtype
+            )
+            key_padding_mask = torch.cat([img_ones, attention_mask], dim=1)
 
         for block in self.blocks:
-            x = block(x)
+            x = block(x, key_padding_mask=key_padding_mask)
 
         x = self.ln_f(x)
 
-        # Return only the text token logits
+        # Hidden states at positions [I-1, I, ..., I+L-1] produce the next-token
+        # logits for text[0..L]. I-1 is the last image position (image-only
+        # context predicts text[0]); I+L-1 is used for generation.
         num_img_tokens = img_emb.shape[1]
-        img_tokens = self.lm_head(x[:, :num_img_tokens])
-        text_tokens = self.lm_head(x[:, num_img_tokens:])
-        return img_tokens, text_tokens
+        pred_hidden = x[:, num_img_tokens - 1 :]
+        return self.lm_head(pred_hidden)
 
     @torch.no_grad()
     def generate(
@@ -359,7 +464,7 @@ class LookingGPT2(nn.Module):
 
         for _ in range(max_new_tokens):
             text_ids = generated[:, -max_text_len:]
-            _, text_logits = self(images, text_ids)
+            text_logits = self(images, text_ids)
             logits = text_logits[:, -1, :]  # (B, vocab_size)
 
             if temperature != 1.0:
@@ -379,7 +484,12 @@ class LookingGPT2(nn.Module):
         return generated
 
     @classmethod
-    def from_pretrained(cls, model_name: str = "gpt2", config: GPT2Config | None = None) -> "LookingGPT2":
+    def from_pretrained(
+        cls,
+        model_name: str = "gpt2",
+        config: GPT2Config | None = None,
+        add_cls: bool = False,
+    ) -> "LookingGPT2":
         """Load a LookingGPT2 model with pretrained GPT-2 weights.
 
         Text embeddings, positional embeddings, transformer blocks, and the
@@ -389,7 +499,9 @@ class LookingGPT2(nn.Module):
         Args:
             model_name: HuggingFace model identifier (e.g. ``"gpt2"``, ``"gpt2-medium"``).
             config: Optional GPT2Config override. If None, defaults matching the
-                pretrained model are used.
+                pretrained model are used and ``add_cls`` fills in the vision field.
+            add_cls: Prepend a learnable CLS token to the image sequence. Only
+                applied when ``config`` is None.
 
         Returns:
             LookingGPT2 model with pretrained weights.
@@ -407,6 +519,7 @@ class LookingGPT2(nn.Module):
                 embed_dim=hf_cfg.n_embd,
                 num_heads=hf_cfg.n_head,
                 num_layers=hf_cfg.n_layer,
+                add_cls=add_cls,
             )
 
         model = cls(config)
