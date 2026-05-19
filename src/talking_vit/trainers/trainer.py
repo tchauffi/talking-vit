@@ -23,28 +23,31 @@ from talking_vit.trainers.dataset import HFImageCaptionDataset
 @dataclass
 class TrainConfig:
     # Data
-    dataset_name: str = "clip-benchmark/wds_mscoco_captions"
+    dataset_name: str = "laion/220k-GPT4Vision-captions-from-LIVIS"
     dataset_split: str = "train"
-    image_col: str = "jpg"
-    caption_col: str = "txt"
+    image_col: str = ""
+    caption_col: str = "short_caption"
+    url_col: str | None = "url"
+    prefetch_workers: int = 16
+    image_cache_dir: str | None = "~/.cache/talking-vit/images"
     shuffle_buffer: int = 1000
-    max_text_len: int = 64
-    num_workers: int = 0   # 0 required for IterableDataset + streaming
+    max_text_len: int = 128
+    num_workers: int = 8   # 0 required for IterableDataset + streaming
 
     # Model
     pretrained: str = "gpt2"
-    use_clip_weights: bool = False
-    add_cls: bool = False
+    use_clip_weights: bool = True
+    add_cls: bool = True
 
     # Optimisation
-    batch_size: int = 16
+    batch_size: int = 32
     num_epochs: int = 10
     lr: float = 1e-3
     backbone_lr: float = 1e-4  # GPT-2 backbone uses a lower LR to preserve language priors
-    weight_decay: float = 0.1
+    weight_decay: float = 1e-2
     warmup_steps: int = 500
     grad_clip: float = 1.0
-    gradient_accumulation_steps: int = 2
+    gradient_accumulation_steps: int = 1
     max_steps: int | None = None  # stop early (smoke tests / quick validation)
 
     # Mixed precision: "no", "fp16", "bf16"
@@ -299,11 +302,15 @@ class Trainer:
             image_size=image_size,
             shuffle_buffer=cfg.shuffle_buffer,
             use_clip_normalization=cfg.use_clip_weights,
+            url_col=cfg.url_col,
+            prefetch_workers=cfg.prefetch_workers,
         )
+        num_shards = getattr(ds.hf_ds, "num_shards", 1) or 1
+        num_workers = min(cfg.num_workers, num_shards)
         return DataLoader(
             ds,
             batch_size=cfg.batch_size,
-            num_workers=cfg.num_workers,
+            num_workers=num_workers,
             pin_memory=accelerator_pin_memory(),
         )
 
