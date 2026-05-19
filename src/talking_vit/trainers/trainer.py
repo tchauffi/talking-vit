@@ -39,8 +39,8 @@ class TrainConfig:
     # Optimisation
     batch_size: int = 16
     num_epochs: int = 10
-    lr: float = 3e-4
-    backbone_lr: float = 3e-5  # GPT-2 backbone uses a lower LR to preserve language priors
+    lr: float = 1e-3
+    backbone_lr: float = 1e-4  # GPT-2 backbone uses a lower LR to preserve language priors
     weight_decay: float = 0.1
     warmup_steps: int = 500
     grad_clip: float = 1.0
@@ -206,7 +206,7 @@ class Trainer:
         done = False
         running_loss = 0.0
         running_micro_count = 0
-        sample_image: torch.Tensor | None = None  # fixed first-batch image for generation
+        sample_images: torch.Tensor | None = None  # fixed first-batch images for generation
         t0 = time.time()
 
         for epoch in range(1, cfg.num_epochs + 1):
@@ -215,9 +215,9 @@ class Trainer:
             model.train()
 
             for images, text_ids, attn_mask in loader:
-                # Pin one image from the very first batch for comparable generation samples.
-                if sample_image is None:
-                    sample_image = images[:1].detach()
+                # Pin two images from the very first batch for comparable generation samples.
+                if sample_images is None:
+                    sample_images = images[:2].detach()
 
                 # Labels: clone input_ids but mask padding with -100 so cross_entropy
                 # ignores them while keeping the appended EOS as a real target.
@@ -271,14 +271,14 @@ class Trainer:
 
                 if global_step % cfg.save_every == 0:
                     self._save(accelerator, global_step)
-                    self._generate_sample(accelerator, model, tokenizer, sample_image, global_step)
+                    self._generate_sample(accelerator, model, tokenizer, sample_images, global_step)
 
                 if cfg.max_steps is not None and global_step >= cfg.max_steps:
                     done = True
                     break
 
         self._save(accelerator, global_step)
-        self._generate_sample(accelerator, model, tokenizer, sample_image, global_step)
+        self._generate_sample(accelerator, model, tokenizer, sample_images, global_step)
         accelerator.end_training()
         if accelerator.is_main_process:
             print("Training complete.")
@@ -318,39 +318,68 @@ class Trainer:
         accelerator: Accelerator,
         model: LookingGPT2,
         tokenizer: GPT2Tokenizer,
-        sample_image: torch.Tensor | None,
+        sample_images: torch.Tensor | None,
         step: int,
     ) -> None:
-        if not accelerator.is_main_process or sample_image is None:
+        if not accelerator.is_main_process or sample_images is None:
             return
 
         cfg = self.cfg
         unwrapped = accelerator.unwrap_model(model)
         unwrapped.eval()
 
-        # Log the sample image (denormalized) so it's visible alongside captions.
         writer = accelerator.get_tracker("tensorboard", unwrap=True)
-        img_display = _denormalize(sample_image[0].float().cpu(), use_clip=cfg.use_clip_weights)
-        writer.add_image("sample/image", img_display, global_step=step)
+        null_image = torch.zeros_like(sample_images[:1])  # blank image for conditioning check
 
-        print("  [samples]")
-        tb_text = []
-        for prompt in cfg.sample_prompts:
-            prompt_ids = tokenizer.encode(prompt, return_tensors="pt").to(sample_image.device)
-            out_ids = unwrapped.generate(
-                sample_image,
-                prompt_ids,
+        for idx, img in enumerate(sample_images):
+            img_batch = img.unsqueeze(0)  # (1, C, H, W)
+
+            img_display = _denormalize(img.float().cpu(), use_clip=cfg.use_clip_weights)
+            writer.add_image(f"sample/image_{idx}", img_display, global_step=step)
+
+            greedy_ids = tokenizer.encode("", return_tensors="pt").to(img_batch.device)
+
+            # Greedy on real image — no sampling noise, best diagnostic for conditioning.
+            greedy_out = unwrapped.generate(
+                img_batch, greedy_ids,
                 max_new_tokens=cfg.sample_max_new_tokens,
-                temperature=cfg.sample_temperature,
-                top_k=cfg.sample_top_k,
+                temperature=0,
                 eos_token_id=tokenizer.eos_token_id,
             )
-            new_ids = out_ids[0, prompt_ids.shape[1]:]
-            continuation = tokenizer.decode(new_ids, skip_special_tokens=True)
-            print(f"    {prompt!r} → {continuation!r}")
-            tb_text.append(f"**{prompt}** {continuation}")
+            greedy_text = tokenizer.decode(greedy_out[0, greedy_ids.shape[1]:], skip_special_tokens=True)
 
-        writer.add_text("sample/captions", "  \n".join(tb_text), global_step=step)
+            # Same prompt, blank image — identical output means image is being ignored.
+            null_out = unwrapped.generate(
+                null_image, greedy_ids,
+                max_new_tokens=cfg.sample_max_new_tokens,
+                temperature=0,
+                eos_token_id=tokenizer.eos_token_id,
+            )
+            null_text = tokenizer.decode(null_out[0, greedy_ids.shape[1]:], skip_special_tokens=True)
+
+            flag = "⚠ same — image ignored" if greedy_text == null_text else "✓ different"
+            print(f"  [img {idx}] greedy: {greedy_text!r}")
+            print(f"  [img {idx}] null  : {null_text!r}  {flag}")
+
+            tb_text = [
+                f"**greedy (real image):** {greedy_text}",
+                f"**greedy (null image):** {null_text}",
+            ]
+            for prompt in cfg.sample_prompts:
+                prompt_ids = tokenizer.encode(prompt, return_tensors="pt").to(img_batch.device)
+                out_ids = unwrapped.generate(
+                    img_batch, prompt_ids,
+                    max_new_tokens=cfg.sample_max_new_tokens,
+                    temperature=cfg.sample_temperature,
+                    top_k=cfg.sample_top_k,
+                    eos_token_id=tokenizer.eos_token_id,
+                )
+                continuation = tokenizer.decode(out_ids[0, prompt_ids.shape[1]:], skip_special_tokens=True)
+                print(f"         {prompt!r} → {continuation!r}")
+                tb_text.append(f"**{prompt}** {continuation}")
+
+            writer.add_text(f"sample/captions_{idx}", "  \n".join(tb_text), global_step=step)
+
         unwrapped.train()
 
 
