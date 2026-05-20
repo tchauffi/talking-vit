@@ -68,6 +68,8 @@ class PatchEmbedder(nn.Module):
             nn.Linear(self.embeded_dim * 4, self.embeded_dim),
         )
 
+        self.out_norm = nn.LayerNorm(self.embeded_dim)
+
         if self.add_cls:
             self.cls_token = nn.Parameter(torch.zeros((1, 1, self.embeded_dim)))
 
@@ -85,9 +87,7 @@ class PatchEmbedder(nn.Module):
         # img_proj[0] is LayerNorm — default init (weight=1, bias=0) is correct.
         nn.init.trunc_normal_(self.img_proj[1].weight, std=0.02)
         nn.init.zeros_(self.img_proj[1].bias)
-        nn.init.trunc_normal_(
-            self.img_proj[3].weight, std=0.02
-        )
+        nn.init.zeros_(self.img_proj[3].weight)
         nn.init.zeros_(self.img_proj[3].bias)
 
         if self.add_cls:
@@ -105,7 +105,6 @@ class PatchEmbedder(nn.Module):
         clip = CLIPVisionModel.from_pretrained(self.CLIP_MODEL)
         clip_weight = clip.embeddings.patch_embedding.weight.data
         self.patch_proj.weight.data.copy_(clip_weight)
-        self.patch_proj.requires_grad_(False)
         del clip
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -124,6 +123,7 @@ class PatchEmbedder(nn.Module):
         cols = torch.arange(n_w, device=x.device).repeat(n_h)
         feat = feat + self.row_emb(rows) + self.col_emb(cols)
         feat = feat + self.img_proj(feat)  # residual: identity at t=0, grows during training
+        feat = self.out_norm(feat)
 
         if self.add_cls:
             cls = self.cls_token.expand(bz, -1, -1)
@@ -238,6 +238,7 @@ class MultiHeadMixedAttention(nn.Module):
         self,
         x: torch.Tensor,
         key_padding_mask: torch.Tensor | None = None,
+        causal_only: bool = False,
     ) -> torch.Tensor:
         """
         Args:
@@ -245,6 +246,8 @@ class MultiHeadMixedAttention(nn.Module):
             key_padding_mask: Optional (batch_size, seq_len) tensor; 1 marks real
                 tokens and 0 marks padding. Padding keys are excluded from
                 attention.
+            causal_only: If True, use a pure causal mask (no image-bidirectional
+                region). Used for the text-only contrastive forward.
 
         Returns:
             Output tensor of shape (batch_size, seq_len, d_out)
@@ -260,7 +263,15 @@ class MultiHeadMixedAttention(nn.Module):
         k = k.view(batch_size, seq_len, self.num_heads, head_dim).transpose(1, 2)
         v = v.view(batch_size, seq_len, self.num_heads, head_dim).transpose(1, 2)
 
-        attn_mask = self.mask[:seq_len, :seq_len]
+        if causal_only:
+            # Pure upper-triangular causal mask; no image bidirectional region.
+            attn_mask = torch.zeros(seq_len, seq_len, device=x.device, dtype=x.dtype)
+            attn_mask.masked_fill_(
+                torch.triu(torch.ones(seq_len, seq_len, dtype=torch.bool, device=x.device), diagonal=1),
+                -float("inf"),
+            )
+        else:
+            attn_mask = self.mask[:seq_len, :seq_len]
 
         # Merge key-padding mask into attn_mask so SDPA sees a single float bias.
         # Padding key positions get -inf, which zeroes them out after softmax.
@@ -322,6 +333,9 @@ class GPT2Config:
     in_dim: int = 3
     use_clip_weights: bool = False
     add_cls: bool = False
+    # Dimension of the contrastive projection heads. Setting > 0 enables
+    # CLIP-style image↔text alignment (see Trainer.contrastive_weight).
+    contrastive_dim: int = 256
 
     @property
     def num_patch_tokens(self) -> int:
@@ -358,8 +372,11 @@ class TransformerBlock(nn.Module):
         self,
         x: torch.Tensor,
         key_padding_mask: torch.Tensor | None = None,
+        causal_only: bool = False,
     ) -> torch.Tensor:
-        x = x + self.attn(self.ln_1(x), key_padding_mask=key_padding_mask)
+        x = x + self.attn(
+            self.ln_1(x), key_padding_mask=key_padding_mask, causal_only=causal_only
+        )
         x = x + self.mlp(self.ln_2(x))
         return x
 
@@ -397,18 +414,37 @@ class LookingGPT2(nn.Module):
         # Tie lm_head weights to token embeddings (as in GPT-2)
         self.lm_head.weight = self.multimod_embedder.text_embedder.embedder.weight
 
+        # Contrastive projection heads: project image / text hidden states to
+        # a shared embedding space. Used by either CLIP-style softmax InfoNCE
+        # or SigLIP-style sigmoid BCE — the heads are loss-formulation agnostic.
+        # logit_scale init matches CLIP; logit_bias starts negative as in SigLIP
+        # so the initial sigmoid input is well below 0 (most pairs are negatives
+        # at init, and sigmoid is most expressive in this regime).
+        if config.contrastive_dim > 0:
+            self.img_contrastive_head = nn.Linear(
+                config.embed_dim, config.contrastive_dim, bias=False
+            )
+            self.txt_contrastive_head = nn.Linear(
+                config.embed_dim, config.contrastive_dim, bias=False
+            )
+            self.logit_scale = nn.Parameter(torch.ones([]) * math.log(1 / 0.07))
+            self.logit_bias = nn.Parameter(torch.tensor(-10.0))
+
     def forward(
         self,
         images: torch.Tensor,
         text_ids: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+        return_contrastive: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Args:
             images: Image tensor of shape (batch_size, in_dim, H, W).
             text_ids: Token IDs of shape (batch_size, text_seq_len).
             attention_mask: Optional (batch_size, text_seq_len) tensor; 1 for real
                 tokens and 0 for padding. Padding keys are excluded from attention.
+            return_contrastive: If True, also return L2-normalised image and text
+                contrastive embeddings (requires ``config.contrastive_dim > 0``).
 
         Returns:
             Logits of shape (batch_size, text_seq_len + 1, vocab_size). The k-th
@@ -416,18 +452,21 @@ class LookingGPT2(nn.Module):
             text tokens [0..k-1]. Index 0 is image-only context (predicts the
             first text token); the final index is the prediction for the token
             that would follow the input sequence (used at generation time).
+            When ``return_contrastive`` is True, returns a 3-tuple
+            ``(logits, img_feat, txt_feat)`` where features are
+            ``(batch_size, contrastive_dim)``.
         """
         img_emb, txt_emb = self.multimod_embedder(images, text_ids)
 
-        # Apply GPT-2 positional embeddings to the full concatenated sequence so
-        # the backbone knows where image tokens sit relative to text tokens.
-        # Image tokens: positions 0..N-1 (additive on top of 2D row/col embeddings).
-        # Text tokens: positions N..N+L-1.
-        num_img = img_emb.shape[1]
-        total_len = num_img + txt_emb.shape[1]
-        positions = torch.arange(total_len, device=img_emb.device)
-        img_emb = img_emb + self.pos_emb(positions[:num_img])
-        txt_emb = txt_emb + self.pos_emb(positions[num_img:])
+        # Apply GPT-2 positional embeddings to *text only*, starting from 0.
+        # Image tokens already have 2D row/col embeddings; injecting pretrained
+        # text positional embeddings into the visual prefix creates a "this is
+        # text from positions 0..N-1" signal that drowns out CLIP features and
+        # encourages the backbone to ignore the image. Text tokens start at
+        # position 0 so GPT-2 sees its familiar "beginning of document"
+        # distribution.
+        txt_positions = torch.arange(txt_emb.shape[1], device=img_emb.device)
+        txt_emb = txt_emb + self.pos_emb(txt_positions)
 
         x = self.drop(torch.cat([img_emb, txt_emb], dim=1))
 
@@ -449,7 +488,68 @@ class LookingGPT2(nn.Module):
         # context predicts text[0]); I+L-1 is used for generation.
         num_img_tokens = img_emb.shape[1]
         pred_hidden = x[:, num_img_tokens - 1 :]
-        return self.lm_head(pred_hidden)
+        logits = self.lm_head(pred_hidden)
+
+        if not return_contrastive:
+            return logits
+
+        # Image pooling: prefer the dedicated [CLS] at position 0 when present;
+        # otherwise mean-pool over all patch positions.
+        if self.config.add_cls:
+            img_pooled = x[:, 0]
+        else:
+            img_pooled = x[:, :num_img_tokens].mean(dim=1)
+
+        # Text pooling: attention-mask-aware mean over real tokens only.
+        text_hidden = x[:, num_img_tokens:]
+        if attention_mask is not None:
+            mask = attention_mask.to(text_hidden.dtype).unsqueeze(-1)
+            txt_pooled = (text_hidden * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1)
+        else:
+            txt_pooled = text_hidden.mean(dim=1)
+
+        img_feat = nn.functional.normalize(self.img_contrastive_head(img_pooled), dim=-1)
+        txt_feat = nn.functional.normalize(self.txt_contrastive_head(txt_pooled), dim=-1)
+        return logits, img_feat, txt_feat
+
+    def text_contrastive_features(
+        self,
+        text_ids: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Pure text-only forward used to derive the contrastive text feature.
+
+        Skips the image embedder entirely and runs the text sequence through
+        the transformer with a pure causal mask. The resulting feature reflects
+        text content alone — no constant null-image prefix, no bidirectional
+        image attention. Cheaper than the zero-image trick (no image tokens to
+        attend over) and conceptually clean.
+
+        Args:
+            text_ids: (batch_size, text_seq_len) token IDs.
+            attention_mask: Optional (batch_size, text_seq_len); 1 for real
+                tokens, 0 for padding.
+
+        Returns:
+            L2-normalised text features of shape (batch_size, contrastive_dim).
+        """
+        txt_emb = self.multimod_embedder.text_embedder(text_ids)
+        positions = torch.arange(text_ids.shape[1], device=text_ids.device)
+        txt_emb = txt_emb + self.pos_emb(positions)
+        x = self.drop(txt_emb)
+
+        for block in self.blocks:
+            x = block(x, key_padding_mask=attention_mask, causal_only=True)
+
+        x = self.ln_f(x)
+
+        if attention_mask is not None:
+            mask = attention_mask.to(x.dtype).unsqueeze(-1)
+            txt_pooled = (x * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1)
+        else:
+            txt_pooled = x.mean(dim=1)
+
+        return nn.functional.normalize(self.txt_contrastive_head(txt_pooled), dim=-1)
 
     @torch.no_grad()
     def generate(
