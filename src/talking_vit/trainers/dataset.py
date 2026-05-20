@@ -60,6 +60,7 @@ class HFImageCaptionDataset(IterableDataset):
         url_timeout: float = 2.0,
         prefetch_workers: int = 16,
         cache_dir: str | None = None,
+        augment: bool = False,
     ):
         from datasets import load_dataset
 
@@ -86,15 +87,32 @@ class HFImageCaptionDataset(IterableDataset):
         # Resize-shorter + CenterCrop preserves aspect ratio. Resize((H, W)) with a
         # tuple stretches the image and silently misaligns captions like
         # "tall building" with squished pixels.
-        self.transform = transforms.Compose([
-            transforms.Resize(
-                image_size,
-                interpolation=transforms.InterpolationMode.LANCZOS,
-            ),
-            transforms.CenterCrop(image_size),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=mean, std=std),
-        ])
+        if augment:
+            # RandomResizedCrop + HFlip + light ColorJitter effectively expand
+            # the dataset and force the patch encoder to learn invariances.
+            # Scale/ratio kept conservative so captions still describe the crop.
+            self.transform = transforms.Compose([
+                transforms.RandomResizedCrop(
+                    image_size,
+                    scale=(0.7, 1.0),
+                    ratio=(0.85, 1.18),
+                    interpolation=transforms.InterpolationMode.LANCZOS,
+                ),
+                transforms.RandomHorizontalFlip(p=0.5),
+                transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=mean, std=std),
+            ])
+        else:
+            self.transform = transforms.Compose([
+                transforms.Resize(
+                    image_size,
+                    interpolation=transforms.InterpolationMode.LANCZOS,
+                ),
+                transforms.CenterCrop(image_size),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=mean, std=std),
+            ])
 
     # ------------------------------------------------------------------
     # Helpers
