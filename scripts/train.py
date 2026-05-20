@@ -29,7 +29,8 @@ def parse_args() -> TrainConfig:
         if t is bool:
             parser.add_argument(f"--{f.name}", default=val, action=argparse.BooleanOptionalAction)
         elif val is None:
-            parser.add_argument(f"--{f.name}", default=val, type=int)
+            arg_type = str if "str" in str(f.type) else int
+            parser.add_argument(f"--{f.name}", default=val, type=arg_type)
         else:
             parser.add_argument(f"--{f.name}", default=val, type=t)
 
